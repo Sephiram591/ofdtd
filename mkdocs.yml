@@ -1,0 +1,37 @@
+site_name: ofdtd
+site_description: Octree-based FDTD tools in JAX
+repo_url: https://github.com/your-user/ofdtd
+repo_name: your-user/ofdtd
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - scripts/gen_ref_pages.py
+  - literate-nav:
+      nav_file: SUMMARY.md
+  - section-index
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: ["src"]
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_signature_annotations: true
+            separate_signature: true
+            inherited_members: true
+            members_order: source
+            filters:
+              - "!^_"
+
+nav:
+  - Home: index.md
+  - API Reference: reference/
