@@ -1,7 +1,7 @@
 site_name: ofdtd
 site_description: Octree-based FDTD tools in JAX
-repo_url: https://github.com/your-user/ofdtd
-repo_name: your-user/ofdtd
+repo_url: https://github.com/Sephiram591/ofdtd
+repo_name: Sephiram591/ofdtd
 
 theme:
   name: material
