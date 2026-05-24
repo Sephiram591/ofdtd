@@ -4,6 +4,11 @@ build:
   os: ubuntu-24.04
   tools:
     python: "3.12"
+  jobs:
+    post_checkout:
+      - git rev-parse HEAD
+      - sed -n '1,120p' mkdocs.yml
+      - sed -n '1,160p' scripts/gen_ref_pages.py
 
 mkdocs:
   configuration: mkdocs.yml
