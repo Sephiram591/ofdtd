@@ -17,22 +17,24 @@ for path in sorted(package_root.rglob("*.py")):
         continue
 
     module_path = path.relative_to(src_root).with_suffix("")
-    parts = list(module_path.parts)
+    doc_path = path.relative_to(src_root).with_suffix(".md")
+    full_doc_path = Path("reference", doc_path)
+
+    parts = tuple(module_path.parts)
 
     if parts[-1] == "__init__":
         parts = parts[:-1]
-        doc_path = Path(*parts) / "index.md"
-    else:
-        doc_path = Path(*parts).with_suffix(".md")
+        doc_path = doc_path.with_name("index.md")
+        full_doc_path = full_doc_path.with_name("index.md")
 
     if not parts:
         continue
 
-    full_doc_path = Path("reference") / doc_path
-    ident = ".".join(parts)
+    # IMPORTANT: use doc_path, not full_doc_path.
+    # reference/SUMMARY.md is already inside reference/.
+    nav[parts] = doc_path.as_posix()
 
-    # This creates the nested folder/file structure in the sidebar.
-    nav[tuple(parts)] = doc_path.as_posix()
+    ident = ".".join(parts)
 
     with mkdocs_gen_files.open(full_doc_path, "w") as fd:
         fd.write(f"# `{ident}`\n\n")
