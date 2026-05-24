@@ -9,7 +9,7 @@ theme:
     - navigation.tabs
     - navigation.tabs.sticky
     - navigation.sections
-    # - navigation.expand
+    - navigation.expand
     - navigation.indexes
     - navigation.path
     - content.code.copy
