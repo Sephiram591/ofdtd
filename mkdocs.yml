@@ -19,7 +19,6 @@ plugins:
         - scripts/gen_ref_pages.py
   - literate-nav:
       nav_file: SUMMARY.md
-  - section-index
   - mkdocstrings:
       handlers:
         python:
