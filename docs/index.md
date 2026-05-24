@@ -1,6 +1,6 @@
 # ofdtd
 
-Welcome to the documentation for `ofdtd`.
+Welcome to the documentation for `ofdtd` hahahah.
 
 ## Installation
 
