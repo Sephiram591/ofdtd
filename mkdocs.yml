@@ -6,8 +6,12 @@ repo_name: Sephiram591/ofdtd
 theme:
   name: material
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
+    # - navigation.expand
     - navigation.indexes
+    - navigation.path
     - content.code.copy
 
 plugins:
