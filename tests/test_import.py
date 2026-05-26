@@ -1,8 +1,7 @@
-from ofdtd import SimulationConfig, make_grid
+from ofdtd import OFDTDBaseModel as ExportedBaseModel
+from ofdtd.base import OFDTDBaseModel, OFDTDSerializationError
 
 
-def test_make_grid_shape() -> None:
-    config = SimulationConfig(nx=4, ny=5, nz=6, dx=0.1, dt=0.01)
-    grid = make_grid(config)
-
-    assert grid.shape == (4, 5, 6)
+def test_public_imports_are_available() -> None:
+    assert ExportedBaseModel is OFDTDBaseModel
+    assert issubclass(OFDTDSerializationError, RuntimeError)

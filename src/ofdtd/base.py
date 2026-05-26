@@ -1,18 +1,16 @@
-"""Base model and HDF5 persistence for OFDTD phase 0.
+"""Base models and HDF5 persistence for OFDTD.
 
-This module deliberately keeps the public object layer Pydantic-based while
-storing numerical arrays as xarray objects in a plain HDF5 hierarchy.
+The public OFDTD object layer is Pydantic-based, immutable by default, and
+serializes recursively to a plain HDF5 hierarchy. Numerical arrays are expected
+to be represented as ``xarray.DataArray`` or ``xarray.Dataset`` objects so that
+array dimensions, coordinates, names, and attributes survive round-trip IO.
 
-Design notes
-------------
-* Every OFDTDBaseModel is immutable and can contain nested OFDTDBaseModel
-  objects.
-* xarray.DataArray and xarray.Dataset fields are stored under /__ofdtd_arrays__.
-* A JSON metadata tree under /__ofdtd__/metadata_json stores model structure,
-  scalar fields, collection structure, class import paths, and references to
-  the xarray HDF5 groups.
-* Raw numpy arrays are rejected at the model-serialization layer; wrap arrays in
-  xr.DataArray or xr.Dataset so dims/coords/attrs survive the round trip.
+Notes
+-----
+Every ``OFDTDBaseModel`` can contain nested ``OFDTDBaseModel`` objects. Nested
+models, xarray objects, collections, and scalar metadata are encoded in a JSON
+metadata tree under ``/__ofdtd__/metadata_json``. Xarray payloads are stored in
+``/__ofdtd_arrays__`` and referenced by the metadata tree.
 """
 
 from __future__ import annotations
@@ -20,17 +18,22 @@ from __future__ import annotations
 import importlib
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar
 
 import h5py
 import numpy as np
 import xarray as xr
+import xarray_jax
 from pydantic import BaseModel, ConfigDict
+from typing_extensions import Self
 
-_FORMAT_NAME = "ofdtd.base_model.hdf5"
+__all__ = ["OFDTDBaseModel", "OFDTDSerializationError"]
+
+_FORMAT_NAME = "ofdtd.model.hdf5"
+_LEGACY_FORMAT_NAMES = {"ofdtd.base_model.hdf5"}
 _FORMAT_VERSION = 1
 _META_GROUP = "__ofdtd__"
 _ARRAY_GROUP = "__ofdtd_arrays__"
@@ -46,6 +49,8 @@ _COMPLEX_KIND = "complex"
 _PATH_KIND = "path"
 _ENUM_KIND = "enum"
 _NONFINITE_FLOAT_KIND = "nonfinite_float"
+_JSON_NUMPY_ARRAY_KIND = "json_numpy_array"
+_REPR_KIND = "repr"
 
 
 class OFDTDSerializationError(RuntimeError):
@@ -59,14 +64,16 @@ class OFDTDBaseModel(BaseModel):
     ``xarray.DataArray`` or ``xarray.Dataset`` instances anywhere in the model
     tree, including inside lists, tuples, or dictionaries.
 
-    Example
-    -------
+    Examples
+    --------
+    >>> import xarray as xr
     >>> class FieldData(OFDTDBaseModel):
     ...     ex: xr.DataArray
-    ...
     >>> fd = FieldData(ex=xr.DataArray([1.0, 2.0], dims=("x",)))
     >>> fd.write_hdf5("field.h5", overwrite=True)
     >>> round_trip = FieldData.read_hdf5("field.h5")
+    >>> round_trip.ex.equals(fd.ex)
+    True
     """
 
     model_config = ConfigDict(
@@ -79,18 +86,42 @@ class OFDTDBaseModel(BaseModel):
     _registry: ClassVar[dict[str, type["OFDTDBaseModel"]]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Register subclasses for HDF5 deserialization.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to ``pydantic.BaseModel`` subclass
+            initialization.
+        """
+
         super().__init_subclass__(**kwargs)
         OFDTDBaseModel._registry[_qualified_name(cls)] = cls
 
     def updated_copy(self: Self, **updates: Any) -> Self:
         """Return a validated copy with selected fields replaced.
 
+        Parameters
+        ----------
+        **updates
+            Field values to replace in the returned model.
+
+        Returns
+        -------
+        Self
+            A new model instance validated by Pydantic.
+
+        Notes
+        -----
         Pydantic's ``model_copy(update=...)`` intentionally skips validation of
-        the updated values, so this helper reconstructs the model through
+        updated values. This helper reconstructs the model through
         ``model_validate`` instead.
         """
 
-        data = {field_name: getattr(self, field_name) for field_name in type(self).model_fields}
+        data = {
+            field_name: getattr(self, field_name)
+            for field_name in type(self).model_fields
+        }
         data.update(updates)
         return type(self).model_validate(data)
 
@@ -106,16 +137,24 @@ class OFDTDBaseModel(BaseModel):
 
         Parameters
         ----------
-        path:
-            Destination ``.h5``/``.hdf5`` path.
-        overwrite:
+        path
+            Destination ``.h5`` or ``.hdf5`` path.
+        overwrite
             If ``False``, raise ``FileExistsError`` when ``path`` already
             exists.
-        compression:
+        compression
             HDF5 compression filter applied to non-scalar numeric array data.
             Set to ``None`` to disable compression.
-        compression_opts:
-            Compression level/options forwarded to h5py.
+        compression_opts
+            Compression level or options forwarded to h5py.
+
+        Raises
+        ------
+        FileExistsError
+            If ``path`` exists and ``overwrite`` is ``False``.
+        TypeError
+            If a field contains an unsupported value, including a raw
+            ``numpy.ndarray`` outside an xarray object.
         """
 
         path = Path(path)
@@ -136,9 +175,22 @@ class OFDTDBaseModel(BaseModel):
     def read_hdf5(cls: type[Self], path: str | Path) -> Self:
         """Read an OFDTD model tree from an HDF5 file.
 
-        The root object is reconstructed using the class path stored in the
-        file. Calling this on a subclass asserts that the stored root object is
-        an instance of that subclass.
+        Parameters
+        ----------
+        path
+            HDF5 file path to read.
+
+        Returns
+        -------
+        Self
+            The root model reconstructed from the file.
+
+        Raises
+        ------
+        TypeError
+            If the stored root model is not an instance of ``cls``.
+        OFDTDSerializationError
+            If the file does not contain a supported OFDTD model payload.
         """
 
         path = Path(path)
@@ -154,16 +206,50 @@ class OFDTDBaseModel(BaseModel):
             )
         return obj
 
-    # Convenience aliases for later Tidy3D-like API spelling.
     def to_hdf5(self, path: str | Path, **kwargs: Any) -> None:
+        """Write this model tree to an HDF5 file.
+
+        Parameters
+        ----------
+        path
+            Destination ``.h5`` or ``.hdf5`` path.
+        **kwargs
+            Keyword arguments forwarded to :meth:`write_hdf5`.
+        """
+
         self.write_hdf5(path, **kwargs)
 
     @classmethod
     def from_hdf5(cls: type[Self], path: str | Path) -> Self:
+        """Read an OFDTD model tree from an HDF5 file.
+
+        Parameters
+        ----------
+        path
+            HDF5 file path to read.
+
+        Returns
+        -------
+        Self
+            The root model reconstructed from the file.
+        """
+
         return cls.read_hdf5(path)
 
 
 class _HDF5ModelWriter:
+    """Stateful helper used while writing one OFDTD HDF5 file.
+
+    Parameters
+    ----------
+    h5
+        Open HDF5 file handle.
+    compression
+        Compression filter for numeric array datasets.
+    compression_opts
+        Compression options forwarded to h5py.
+    """
+
     def __init__(
         self,
         *,
@@ -178,6 +264,14 @@ class _HDF5ModelWriter:
         self.h5.require_group(_ARRAY_GROUP)
 
     def write_metadata(self, metadata: dict[str, Any]) -> None:
+        """Write the JSON metadata tree.
+
+        Parameters
+        ----------
+        metadata
+            Encoded JSON-compatible model tree.
+        """
+
         meta_group = self.h5.require_group(_META_GROUP)
         meta_group.attrs["format"] = _FORMAT_NAME
         meta_group.attrs["format_version"] = _FORMAT_VERSION
@@ -194,6 +288,19 @@ class _HDF5ModelWriter:
         meta_group.create_dataset(_META_DATASET, data=np.void(payload))
 
     def write_dataarray(self, value: xr.DataArray) -> str:
+        """Write an xarray ``DataArray`` payload.
+
+        Parameters
+        ----------
+        value
+            DataArray to write.
+
+        Returns
+        -------
+        str
+            HDF5 group path containing the serialized DataArray.
+        """
+
         group_path = self._next_array_group_path()
         group = self.h5.create_group(group_path)
         _write_xarray_dataarray(
@@ -206,6 +313,19 @@ class _HDF5ModelWriter:
         return group_path
 
     def write_dataset(self, value: xr.Dataset) -> str:
+        """Write an xarray ``Dataset`` payload.
+
+        Parameters
+        ----------
+        value
+            Dataset to write.
+
+        Returns
+        -------
+        str
+            HDF5 group path containing the serialized Dataset.
+        """
+
         group_path = self._next_array_group_path()
         group = self.h5.create_group(group_path)
         _write_xarray_dataset(
@@ -217,22 +337,53 @@ class _HDF5ModelWriter:
         return group_path
 
     def _next_array_group_path(self) -> str:
+        """Return the next unique array-group path.
+
+        Returns
+        -------
+        str
+            Absolute HDF5 path under ``/__ofdtd_arrays__``.
+        """
+
         group_path = f"/{_ARRAY_GROUP}/array_{self.array_count:08d}"
         self.array_count += 1
         return group_path
 
 
 class _HDF5ModelReader:
+    """Stateful helper used while reading one OFDTD HDF5 file.
+
+    Parameters
+    ----------
+    h5
+        Open HDF5 file handle.
+    """
+
     def __init__(self, *, h5: h5py.File) -> None:
         self.h5 = h5
 
     def read_metadata(self) -> dict[str, Any]:
+        """Read the JSON metadata tree.
+
+        Returns
+        -------
+        dict[str, Any]
+            Encoded JSON-compatible model tree.
+
+        Raises
+        ------
+        OFDTDSerializationError
+            If the file is not an OFDTD base-model HDF5 file.
+        """
+
         if _META_GROUP not in self.h5:
             raise OFDTDSerializationError(f"Missing HDF5 group /{_META_GROUP}")
         meta_group = self.h5[_META_GROUP]
-        if meta_group.attrs.get("format") != _FORMAT_NAME:
+        format_name = meta_group.attrs.get("format")
+        known_format_names = {_FORMAT_NAME, *_LEGACY_FORMAT_NAMES}
+        if format_name not in known_format_names:
             raise OFDTDSerializationError(
-                f"Not an OFDTD base-model file: {meta_group.attrs.get('format')!r}"
+                f"Not an OFDTD base-model file: {format_name!r}"
             )
         version = int(meta_group.attrs.get("format_version", -1))
         if version != _FORMAT_VERSION:
@@ -252,21 +403,63 @@ class _HDF5ModelReader:
             payload = raw.decode("utf-8")
         else:
             payload = str(raw)
-        return json.loads(payload)
+        loaded = json.loads(payload)
+        if not isinstance(loaded, dict):
+            raise OFDTDSerializationError("Root metadata payload must be a JSON object")
+        return loaded
 
     def read_dataarray(self, group_path: str) -> xr.DataArray:
+        """Read an xarray ``DataArray`` payload.
+
+        Parameters
+        ----------
+        group_path
+            HDF5 group path containing the serialized DataArray.
+
+        Returns
+        -------
+        xarray.DataArray
+            Reconstructed DataArray.
+        """
+
         if group_path not in self.h5:
             raise OFDTDSerializationError(f"Missing xarray DataArray group {group_path}")
         return _read_xarray_dataarray(self.h5[group_path])
 
     def read_dataset(self, group_path: str) -> xr.Dataset:
+        """Read an xarray ``Dataset`` payload.
+
+        Parameters
+        ----------
+        group_path
+            HDF5 group path containing the serialized Dataset.
+
+        Returns
+        -------
+        xarray.Dataset
+            Reconstructed Dataset.
+        """
+
         if group_path not in self.h5:
             raise OFDTDSerializationError(f"Missing xarray Dataset group {group_path}")
         return _read_xarray_dataset(self.h5[group_path])
 
 
 def _encode_value(value: Any, writer: _HDF5ModelWriter) -> Any:
-    """Encode arbitrary supported model-field value into JSON metadata."""
+    """Encode a supported model-field value into JSON metadata.
+
+    Parameters
+    ----------
+    value
+        Field value to encode.
+    writer
+        HDF5 writer that stores out-of-line xarray payloads.
+
+    Returns
+    -------
+    Any
+        JSON-compatible encoded representation.
+    """
 
     if isinstance(value, OFDTDBaseModel):
         fields: dict[str, Any] = {}
@@ -314,15 +507,9 @@ def _encode_value(value: Any, writer: _HDF5ModelWriter) -> Any:
         return {_KIND_KEY: _COMPLEX_KIND, "real": value.real, "imag": value.imag}
 
     if isinstance(value, float) and not math.isfinite(value):
-        if math.isnan(value):
-            marker = "nan"
-        elif value > 0:
-            marker = "inf"
-        else:
-            marker = "-inf"
-        return {_KIND_KEY: _NONFINITE_FLOAT_KIND, "value": marker}
+        return {_KIND_KEY: _NONFINITE_FLOAT_KIND, "value": _nonfinite_marker(value)}
 
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, bool | int | float | str):
         return value
 
     if isinstance(value, tuple):
@@ -353,7 +540,20 @@ def _encode_value(value: Any, writer: _HDF5ModelWriter) -> Any:
 
 
 def _decode_value(node: Any, reader: _HDF5ModelReader) -> Any:
-    """Decode a JSON metadata node back into Python objects."""
+    """Decode a JSON metadata node back into Python objects.
+
+    Parameters
+    ----------
+    node
+        Encoded JSON metadata node.
+    reader
+        HDF5 reader that loads referenced xarray payloads.
+
+    Returns
+    -------
+    Any
+        Decoded Python value.
+    """
 
     if not isinstance(node, dict) or _KIND_KEY not in node:
         return node
@@ -397,14 +597,7 @@ def _decode_value(node: Any, reader: _HDF5ModelReader) -> Any:
         return enum_cls(_decode_value(node["value"], reader))
 
     if kind == _NONFINITE_FLOAT_KIND:
-        value = node["value"]
-        if value == "nan":
-            return float("nan")
-        if value == "inf":
-            return float("inf")
-        if value == "-inf":
-            return float("-inf")
-        raise OFDTDSerializationError(f"Unknown non-finite float marker: {value!r}")
+        return _decode_nonfinite_marker(node["value"])
 
     raise OFDTDSerializationError(f"Unknown encoded metadata kind: {kind!r}")
 
@@ -416,6 +609,20 @@ def _write_xarray_dataset(
     compression: str | None,
     compression_opts: int | None,
 ) -> None:
+    """Write an xarray ``Dataset`` into an HDF5 group.
+
+    Parameters
+    ----------
+    group
+        Destination HDF5 group.
+    value
+        Dataset to write.
+    compression
+        Compression filter for numeric array datasets.
+    compression_opts
+        Compression options forwarded to h5py.
+    """
+
     group.attrs["xarray_kind"] = "Dataset"
     group.attrs["attrs_json"] = json.dumps(_json_safe(value.attrs), allow_nan=False)
 
@@ -439,8 +646,23 @@ def _write_xarray_dataset(
 
 
 def _read_xarray_dataset(group: h5py.Group) -> xr.Dataset:
+    """Read an xarray ``Dataset`` from an HDF5 group.
+
+    Parameters
+    ----------
+    group
+        Source HDF5 group.
+
+    Returns
+    -------
+    xarray.Dataset
+        Reconstructed Dataset.
+    """
+
     if group.attrs.get("xarray_kind") != "Dataset":
-        raise OFDTDSerializationError(f"HDF5 group {group.name} is not an xarray Dataset")
+        raise OFDTDSerializationError(
+            f"HDF5 group {group.name} is not an xarray Dataset"
+        )
 
     coords = _read_named_dataarrays(group["coords"])
     data_vars = _read_named_dataarrays(group["data_vars"])
@@ -456,11 +678,28 @@ def _write_named_dataarrays(
     compression: str | None,
     compression_opts: int | None,
 ) -> None:
+    """Write a name-to-DataArray mapping into child HDF5 groups.
+
+    Parameters
+    ----------
+    group
+        Destination HDF5 group.
+    values
+        Mapping whose values are xarray DataArrays.
+    include_coords
+        If ``True``, write each DataArray's coordinates recursively.
+    compression
+        Compression filter for numeric array datasets.
+    compression_opts
+        Compression options forwarded to h5py.
+    """
+
     order: list[str] = []
     for index, (name, dataarray) in enumerate(values.items()):
         if not isinstance(name, str):
             raise TypeError(
-                f"Only string xarray names are supported in HDF5 persistence; got {name!r}."
+                "Only string xarray names are supported in HDF5 persistence; "
+                f"got {name!r}."
             )
         child_name = f"item_{index:08d}"
         order.append(child_name)
@@ -477,6 +716,19 @@ def _write_named_dataarrays(
 
 
 def _read_named_dataarrays(group: h5py.Group) -> dict[str, xr.DataArray]:
+    """Read a name-to-DataArray mapping from child HDF5 groups.
+
+    Parameters
+    ----------
+    group
+        Source HDF5 group.
+
+    Returns
+    -------
+    dict[str, xarray.DataArray]
+        Reconstructed mapping.
+    """
+
     result: dict[str, xr.DataArray] = {}
     order = json.loads(group.attrs.get("order_json", "[]"))
     for child_name in order:
@@ -494,6 +746,22 @@ def _write_xarray_dataarray(
     compression: str | None,
     compression_opts: int | None,
 ) -> None:
+    """Write an xarray ``DataArray`` into an HDF5 group.
+
+    Parameters
+    ----------
+    group
+        Destination HDF5 group.
+    value
+        DataArray to write.
+    include_coords
+        If ``True``, write the DataArray's coordinates recursively.
+    compression
+        Compression filter for numeric array datasets.
+    compression_opts
+        Compression options forwarded to h5py.
+    """
+
     group.attrs["xarray_kind"] = "DataArray"
     group.attrs["name_json"] = json.dumps(value.name, allow_nan=False)
     group.attrs["dims_json"] = json.dumps(list(value.dims), allow_nan=False)
@@ -521,8 +789,23 @@ def _write_xarray_dataarray(
 
 
 def _read_xarray_dataarray(group: h5py.Group) -> xr.DataArray:
+    """Read an xarray ``DataArray`` from an HDF5 group.
+
+    Parameters
+    ----------
+    group
+        Source HDF5 group.
+
+    Returns
+    -------
+    xarray.DataArray
+        Reconstructed DataArray.
+    """
+
     if group.attrs.get("xarray_kind") != "DataArray":
-        raise OFDTDSerializationError(f"HDF5 group {group.name} is not an xarray DataArray")
+        raise OFDTDSerializationError(
+            f"HDF5 group {group.name} is not an xarray DataArray"
+        )
 
     data = _read_hdf5_array(group["data"])
     dims = tuple(json.loads(group.attrs["dims_json"]))
@@ -540,6 +823,22 @@ def _write_hdf5_array(
     compression: str | None,
     compression_opts: int | None,
 ) -> None:
+    """Write array-like data into an HDF5 dataset.
+
+    Parameters
+    ----------
+    group
+        Destination HDF5 group.
+    name
+        Dataset name.
+    value
+        Array-like data to write.
+    compression
+        Compression filter for numeric array datasets.
+    compression_opts
+        Compression options forwarded to h5py.
+    """
+
     array = np.asarray(value)
     data: Any = array
     dtype: Any | None = None
@@ -557,8 +856,9 @@ def _write_hdf5_array(
             data = _object_array_to_string_array(array)
         else:
             raise TypeError(
-                f"Object-dtype xarray data at {group.name}/{name} cannot be stored safely. "
-                "Use numeric, bool, complex, datetime, timedelta, or string data."
+                f"Object-dtype xarray data at {group.name}/{name} cannot be stored "
+                "safely. Use numeric, bool, complex, datetime, timedelta, or "
+                "string data."
             )
     elif array.dtype.kind == "M":
         encoding = "datetime64_as_int64"
@@ -588,7 +888,20 @@ def _write_hdf5_array(
         dataset.attrs["original_dtype"] = original_dtype
 
 
-def _read_hdf5_array(dataset: h5py.Dataset) -> np.ndarray | np.generic:
+def _read_hdf5_array(dataset: h5py.Dataset) -> Any:
+    """Read array-like data from an HDF5 dataset.
+
+    Parameters
+    ----------
+    dataset
+        Source HDF5 dataset.
+
+    Returns
+    -------
+    Any
+        NumPy scalar or array reconstructed from the dataset.
+    """
+
     encoding = dataset.attrs.get("encoding")
 
     if encoding == "utf8_string":
@@ -603,17 +916,43 @@ def _read_hdf5_array(dataset: h5py.Dataset) -> np.ndarray | np.generic:
 
 
 def _object_array_is_string_like(array: np.ndarray) -> bool:
+    """Return whether an object array contains only string-like values.
+
+    Parameters
+    ----------
+    array
+        Object-dtype array to inspect.
+
+    Returns
+    -------
+    bool
+        ``True`` if every non-``None`` item is string-like.
+    """
+
     for item in array.ravel():
-        if item is not None and not isinstance(item, (str, bytes, np.str_, np.bytes_)):
+        if item is not None and not isinstance(item, str | bytes | np.str_ | np.bytes_):
             return False
     return True
 
 
 def _object_array_to_string_array(array: np.ndarray) -> np.ndarray:
+    """Convert an object array of string-like values to UTF-8 strings.
+
+    Parameters
+    ----------
+    array
+        Object-dtype array to normalize.
+
+    Returns
+    -------
+    numpy.ndarray
+        Object array containing normalized Python strings.
+    """
+
     def normalize(item: Any) -> str:
         if item is None:
             return ""
-        if isinstance(item, (bytes, np.bytes_)):
+        if isinstance(item, bytes | np.bytes_):
             return bytes(item).decode("utf-8")
         return str(item)
 
@@ -621,21 +960,26 @@ def _object_array_to_string_array(array: np.ndarray) -> np.ndarray:
 
 
 def _json_safe(value: Any) -> Any:
-    """Convert xarray attrs to a JSON-safe representation."""
+    """Convert xarray attributes to a JSON-safe representation.
 
-    if value is None or isinstance(value, (bool, int, str)):
+    Parameters
+    ----------
+    value
+        Attribute value to encode.
+
+    Returns
+    -------
+    Any
+        JSON-compatible representation.
+    """
+
+    if value is None or isinstance(value, bool | int | str):
         return value
 
     if isinstance(value, float):
         if math.isfinite(value):
             return value
-        if math.isnan(value):
-            marker = "nan"
-        elif value > 0:
-            marker = "inf"
-        else:
-            marker = "-inf"
-        return {_KIND_KEY: _NONFINITE_FLOAT_KIND, "value": marker}
+        return {_KIND_KEY: _NONFINITE_FLOAT_KIND, "value": _nonfinite_marker(value)}
 
     if isinstance(value, complex):
         return {_KIND_KEY: _COMPLEX_KIND, "real": value.real, "imag": value.imag}
@@ -645,7 +989,7 @@ def _json_safe(value: Any) -> Any:
 
     if isinstance(value, np.ndarray):
         return {
-            _KIND_KEY: "json_numpy_array",
+            _KIND_KEY: _JSON_NUMPY_ARRAY_KIND,
             "dtype": str(value.dtype),
             "shape": list(value.shape),
             "value": value.tolist(),
@@ -671,13 +1015,26 @@ def _json_safe(value: Any) -> Any:
         return {str(k): _json_safe(v) for k, v in value.items()}
 
     return {
-        _KIND_KEY: "repr",
+        _KIND_KEY: _REPR_KIND,
         "class": _qualified_name(type(value)),
         "value": repr(value),
     }
 
 
 def _json_restore(value: Any) -> Any:
+    """Restore xarray attributes from their JSON-safe representation.
+
+    Parameters
+    ----------
+    value
+        JSON-compatible representation.
+
+    Returns
+    -------
+    Any
+        Restored attribute value.
+    """
+
     if not isinstance(value, dict) or _KIND_KEY not in value:
         if isinstance(value, list):
             return [_json_restore(v) for v in value]
@@ -687,7 +1044,7 @@ def _json_restore(value: Any) -> Any:
 
     kind = value[_KIND_KEY]
     if kind == _NONFINITE_FLOAT_KIND:
-        return _decode_value(value, _NoArrayReader())
+        return _decode_nonfinite_marker(value["value"])
     if kind == _COMPLEX_KIND:
         return complex(value["real"], value["imag"])
     if kind == _PATH_KIND:
@@ -697,32 +1054,118 @@ def _json_restore(value: Any) -> Any:
         return enum_cls(_json_restore(value["value"]))
     if kind == _TUPLE_KIND:
         return tuple(_json_restore(v) for v in value["items"])
-    if kind == "json_numpy_array":
-        return np.asarray(value["value"], dtype=np.dtype(value["dtype"])).reshape(value["shape"])
-    if kind == "repr":
+    if kind == _JSON_NUMPY_ARRAY_KIND:
+        return np.asarray(value["value"], dtype=np.dtype(value["dtype"])).reshape(
+            value["shape"]
+        )
+    if kind == _REPR_KIND:
         return value["value"]
     return value
 
 
-class _NoArrayReader:
-    """Tiny stand-in used only for restoring non-array attr markers."""
+def _nonfinite_marker(value: float) -> str:
+    """Return the JSON marker for a non-finite float.
+
+    Parameters
+    ----------
+    value
+        Non-finite float value.
+
+    Returns
+    -------
+    str
+        One of ``"nan"``, ``"inf"``, or ``"-inf"``.
+    """
+
+    if math.isnan(value):
+        return "nan"
+    if value > 0:
+        return "inf"
+    return "-inf"
+
+
+def _decode_nonfinite_marker(value: str) -> float:
+    """Decode a non-finite float marker.
+
+    Parameters
+    ----------
+    value
+        Marker to decode.
+
+    Returns
+    -------
+    float
+        Decoded non-finite float.
+
+    Raises
+    ------
+    OFDTDSerializationError
+        If ``value`` is not a known marker.
+    """
+
+    if value == "nan":
+        return float("nan")
+    if value == "inf":
+        return float("inf")
+    if value == "-inf":
+        return float("-inf")
+    raise OFDTDSerializationError(f"Unknown non-finite float marker: {value!r}")
 
 
 def _qualified_name(cls: type[Any]) -> str:
+    """Return the import path for a class.
+
+    Parameters
+    ----------
+    cls
+        Class to name.
+
+    Returns
+    -------
+    str
+        Qualified path in ``module:qualname`` form.
+    """
+
     return f"{cls.__module__}:{cls.__qualname__}"
 
 
 def _resolve_model_class(path: str) -> type[OFDTDBaseModel]:
+    """Resolve an import path to an ``OFDTDBaseModel`` subclass.
+
+    Parameters
+    ----------
+    path
+        Qualified path in ``module:qualname`` form.
+
+    Returns
+    -------
+    type[OFDTDBaseModel]
+        Resolved model class.
+    """
+
     if path in OFDTDBaseModel._registry:
         return OFDTDBaseModel._registry[path]
     cls = _resolve_class(path)
-    if not isinstance(cls, type) or not issubclass(cls, OFDTDBaseModel):
+    if not issubclass(cls, OFDTDBaseModel):
         raise OFDTDSerializationError(f"Resolved class {path!r} is not an OFDTDBaseModel")
     OFDTDBaseModel._registry[path] = cls
     return cls
 
 
 def _resolve_class(path: str) -> type[Any]:
+    """Resolve an import path to a class.
+
+    Parameters
+    ----------
+    path
+        Qualified path in ``module:qualname`` form.
+
+    Returns
+    -------
+    type[Any]
+        Resolved class.
+    """
+
     module_name, sep, qualname = path.partition(":")
     if not sep:
         raise OFDTDSerializationError(f"Invalid qualified class path {path!r}")
